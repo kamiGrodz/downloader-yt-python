@@ -170,7 +170,7 @@ def download_single(url, quality=None, audio_only=False, audio_codec='aac', audi
             print(f"Error: {e}")
 
 
-def main():
+def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--fetch', action='store_true', help='Fetch video info only')
     parser.add_argument('--download', action='store_true', help='Download videos from channels')
@@ -181,7 +181,7 @@ def main():
     parser.add_argument('--audio_codec', default='aac', help='Audio codec (default: aac)')
     parser.add_argument('--audio_quality', default='320', help='Audio quality in kbps (default: 320)')
 
-    args = parser.parse_args()
+    args = parser.parse_args(args)
 
     if args.single:
         download_single(args.single, args.q, args.audio_only, args.audio_codec, args.audio_quality)
