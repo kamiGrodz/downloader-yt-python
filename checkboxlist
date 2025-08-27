@@ -1,0 +1,64 @@
+import json
+import sys
+import os
+import customtkinter as ct
+
+def add_sample_content(file_path):
+    content = """
+{
+  "id": "1",
+  "title": "Final Fantasy XVI The Rising Tide DLC",
+  "completed": "False",
+  "date_completed": "0",
+  "platform": "PS5",
+  "rating": "81/100"
+}
+    """
+    with open(file_path, 'w') as write_file:
+        write_file.write(content)
+
+def open_json():
+    file_path = "./games.json"
+    try:
+        file = open(file_path)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        creation_choice = input("Do you want to create this file (Y/N): ").lower()
+        if creation_choice != "y":
+            print("No json file. Exiting.")
+            sys.exit(1)
+        with open(file_path, "w"):
+            print("File created!\n")
+            file = open(file_path)
+
+    if os.stat(file_path).st_size == 0:
+        create_sample = input("Json file is empty.\nDo you want to create sample content? (Y/N): ").lower()
+        if create_sample != "y":
+            print("No contents in json. Exiting.")
+            sys.exit(1)
+        else:
+            add_sample_content(file_path)
+
+    with file:
+        json_data = json.load(file)
+
+    return json_data
+
+def main():
+    root = ct.CTk()
+    root.title("Gamelog")
+    root.geometry("500x600+400+200")
+    open_json()
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+
+# To add:
+# banner at the top of the window with "Gamelog" in Ascii art
+# Checkbox list
+# If game is completed, change color background to green
+# Rating influences rating color background
+# PEP compliance
+# Comments
+#
