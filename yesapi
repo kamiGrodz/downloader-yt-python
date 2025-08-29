@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+YouTube Video Downloader Script (API Version)
+Fetches latest videos from YouTube channels using YouTube Data API and downloads them
+"""
+
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+
+try:
+    import yt_dlp
+except ImportError:
+    print("yt-dlp is required. Install it with: pip install yt-dlp")
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("requests is required. Install it with: pip install requests")
+    sys.exit(1)
+
+
+class YouTubeDownloaderAPI:
+    def __init__(self):
+        self.config_file = "config_api.json"
+        self.videos_file = "fetched_videos_api.json"
+        self.config = self.load_config()
+
+    def load_config(self) -> Dict:
+        """Load configuration from file or create default"""
+        default_config = {
+            "api_key": "",
+            "channels": [
+                "UCXuqSBlHAE6Xw-yeJA0Tunw",  # Linus Tech Tips
+                "UCBJycsmduvYEL83R_U4JriQ",  # MKBHD
+                "UCeeFfhMcJa1kjtfZAGskOCA"  # TechLinked
+            ],
+            "download_path": "./downloads",
+            "default_days": 3,
+            "video_quality": "best",
+            "audio_quality": "best",
+            "format": "mkv",
+            "audio_only": False,
+            "subtitle_languages": ["en"],
+            "download_subtitles": True,
+            "max_results": 50
+        }
+
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                # Merge with defaults to ensure all keys exist
+                for key, value in default_config.items():
+                    if key not in loaded_config:
+                        loaded_config[key] = value
+                return loaded_config
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Error loading config: {e}")
+                print("Using default configuration")
+
+        # Save default config
+        self.save_config(default_config)
+        return default_config
+
+    def save_config(self, config: Dict = None) -> None:
+        """Save configuration to file"""
+        config = config or self.config
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+        except IOError as e:
+            print(f"Error saving config: {e}")
+
+    def check_api_key(self) -> bool:
+        """Check if API key is configured"""
+        if not self.config.get("api_key"):
+            print("YouTube Data API key not configured!")
+            print("Please set your API key in the configuration menu.")
+            print("Get your API key from: https://console.developers.google.com/")
+            return False
+        return True
+
+    def get_channel_id_from_handle(self, handle: str) -> Optional[str]:
+        """Convert channel handle to channel ID using YouTube Data API"""
+        if not self.check_api_key():
+            return None
+
+        # Remove @ if present
+        handle = handle.lstrip('@')
+
+        # Try different search methods
+        search_terms = [f"@{handle}", handle]
+
+        for term in search_terms:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                'key': self.config['api_key'],
+                'part': 'snippet',
+                'type': 'channel',
+                'q': term,
+                'maxResults': 5
+            }
+
+            try:
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+
+                if data.get('items'):
+                    # Look for exact match
+                    for item in data['items']:
+                        snippet = item['snippet']
+                        if (snippet.get('customUrl', '').lower() == f"@{handle.lower()}" or
+                                snippet.get('title', '').lower() == handle.lower()):
+                            return item['snippet']['channelId']
+
+                    # Return first result if no exact match
+                    return data['items'][0]['snippet']['channelId']
+
+            except requests.RequestException as e:
+                print(f"Error searching for channel {handle}: {e}")
+                continue
+
+        return None
+
+    def get_yt_dlp_opts(self, audio_only: bool = False, custom_quality: str = None) -> Dict:
+        """Get yt-dlp options based on configuration"""
+        download_path = Path(self.config["download_path"])
+        download_path.mkdir(exist_ok=True)
+
+        if audio_only:
+            opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': str(download_path / '%(uploader)s/%(title)s.%(ext)s'),
+                'extractaudio': True,
+                'audioformat': 'mp3',
+                'audioquality': '192K',
+            }
+        else:
+            format_selector = custom_quality or self.config["video_quality"]
+            if format_selector == "best":
+                format_str = f'best[ext={self.config["format"]}]/best'
+            else:
+                format_str = format_selector
+
+            opts = {
+                'format': format_str,
+                'outtmpl': str(download_path / '%(uploader)s/%(title)s.%(ext)s'),
+                'merge_output_format': self.config["format"],
+            }
+
+        if self.config.get("download_subtitles", True):
+            opts.update({
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': self.config.get("subtitle_languages", ["en"]),
+            })
+
+        opts.update({
+            'ignoreerrors': True,
+            'no_warnings': False,
+            'extractflat': False,
+        })
+
+        return opts
+
+    def fetch_channel_videos(self, days: int = None) -> List[Dict]:
+        """Fetch latest videos from configured channels using YouTube Data API"""
+        if not self.check_api_key():
+            return []
+
+        days = days or self.config["default_days"]
+        cutoff_date = datetime.now() - timedelta(days=days)
+        all_videos = []
+
+        print(f"Fetching videos from the last {days} days using YouTube Data API...")
+
+        for channel_identifier in self.config["channels"]:
+            print(f"Processing channel: {channel_identifier}")
+
+            # Determine if it's a channel ID or handle
+            if channel_identifier.startswith('@') or len(channel_identifier) != 24:
+                # It's a handle, convert to channel ID
+                channel_id = self.get_channel_id_from_handle(channel_identifier)
+                if not channel_id:
+                    print(f"Could not find channel ID for {channel_identifier}")
+                    continue
+            else:
+                channel_id = channel_identifier
+
+            try:
+                # Get channel videos
+                url = "https://www.googleapis.com/youtube/v3/search"
+                params = {
+                    'key': self.config['api_key'],
+                    'channelId': channel_id,
+                    'part': 'snippet',
+                    'order': 'date',
+                    'type': 'video',
+                    'publishedAfter': cutoff_date.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'maxResults': self.config.get('max_results', 50)
+                }
+
+                response = requests.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+
+                # Get video details for each video
+                video_ids = [item['id']['videoId'] for item in data.get('items', [])]
+
+                if video_ids:
+                    # Get detailed video information
+                    details_url = "https://www.googleapis.com/youtube/v3/videos"
+                    details_params = {
+                        'key': self.config['api_key'],
+                        'id': ','.join(video_ids),
+                        'part': 'snippet,statistics,contentDetails'
+                    }
+
+                    details_response = requests.get(details_url, params=details_params, timeout=30)
+                    details_response.raise_for_status()
+                    details_data = details_response.json()
+
+                    for video in details_data.get('items', []):
+                        snippet = video['snippet']
+                        statistics = video.get('statistics', {})
+
+                        # Parse duration
+                        duration_str = video.get('contentDetails', {}).get('duration', 'PT0S')
+                        duration_seconds = self._parse_duration(duration_str)
+
+                        video_data = {
+                            'id': video['id'],
+                            'title': snippet.get('title', 'Unknown'),
+                            'uploader': snippet.get('channelTitle', 'Unknown'),
+                            'upload_date': snippet.get('publishedAt', '').replace('-', '').replace(':', '').split('T')[
+                                0],
+                            'url': f"https://www.youtube.com/watch?v={video['id']}",
+                            'duration': duration_seconds,
+                            'view_count': int(statistics.get('viewCount', 0)),
+                            'like_count': int(statistics.get('likeCount', 0)),
+                            'description': snippet.get('description', '')[:200] + '...' if len(
+                                snippet.get('description', '')) > 200 else snippet.get('description', '')
+                        }
+                        all_videos.append(video_data)
+
+                print(f"Found {len(video_ids)} videos from {channel_identifier}")
+
+            except requests.RequestException as e:
+                print(f"Error fetching from channel {channel_identifier}: {e}")
+                continue
+            except Exception as e:
+                print(f"Unexpected error with channel {channel_identifier}: {e}")
+                continue
+
+        # Sort by upload date (newest first)
+        all_videos.sort(key=lambda x: x['upload_date'], reverse=True)
+
+        # Save to JSON file
+        try:
+            with open(self.videos_file, 'w', encoding='utf-8') as f:
+                json.dump(all_videos, f, indent=4, ensure_ascii=False)
+            print(f"Saved {len(all_videos)} videos to {self.videos_file}")
+        except IOError as e:
+            print(f"Error saving videos: {e}")
+
+        return all_videos
+
+    def _parse_duration(self, duration_str: str) -> int:
+        """Parse ISO 8601 duration to seconds"""
+        import re
+
+        # PT1H2M3S -> 3723 seconds
+        pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+        match = re.match(pattern, duration_str)
+
+        if not match:
+            return 0
+
+        hours = int(match.group(1)) if match.group(1) else 0
+        minutes = int(match.group(2)) if match.group(2) else 0
+        seconds = int(match.group(3)) if match.group(3) else 0
+
+        return hours * 3600 + minutes * 60 + seconds
+
+    def download_from_json(self) -> None:
+        """Download videos from the fetched JSON file"""
+        if not os.path.exists(self.videos_file):
+            print(f"No video file found. Please fetch videos first.")
+            return
+
+        try:
+            with open(self.videos_file, 'r', encoding='utf-8') as f:
+                videos = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error reading video file: {e}")
+            return
+
+        if not videos:
+            print("No videos found in the file.")
+            return
+
+        print(f"Found {len(videos)} videos to download.")
+
+        # Show videos and let user select
+        print("\nAvailable videos:")
+        for i, video in enumerate(videos, 1):
+            duration_str = f"{video['duration'] // 60}:{video['duration'] % 60:02d}" if video['duration'] else "Unknown"
+            views = f"{video['view_count']:,}" if video['view_count'] else "Unknown"
+            print(f"{i:2d}. {video['uploader']} - {video['title']}")
+            print(f"     Duration: {duration_str} | Views: {views} | Date: {video['upload_date']}")
+
+        choice = input(
+            f"\nEnter video numbers to download (1-{len(videos)}, 'all' for all, or ranges like '1-5'): ").strip()
+
+        if choice.lower() == 'all':
+            selected_videos = videos
+        else:
+            selected_videos = self._parse_selection(choice, videos)
+
+        if not selected_videos:
+            print("No videos selected.")
+            return
+
+        print(f"Downloading {len(selected_videos)} videos...")
+
+        ydl_opts = self.get_yt_dlp_opts(audio_only=self.config["audio_only"])
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            for video in selected_videos:
+                try:
+                    print(f"Downloading: {video['title']}")
+                    ydl.download([video['url']])
+                except Exception as e:
+                    print(f"Error downloading {video['title']}: {e}")
+
+    def download_from_file(self, file_path: str) -> None:
+        """Download videos from a file containing YouTube links"""
+        if not os.path.exists(file_path):
+            print(f"File {file_path} not found.")
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except IOError as e:
+            print(f"Error reading file: {e}")
+            return
+
+        # Extract YouTube URLs using regex
+        youtube_regex = r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})'
+        urls = re.findall(youtube_regex, content)
+
+        if not urls:
+            print("No YouTube URLs found in the file.")
+            return
+
+        # Convert to full URLs
+        full_urls = [f"https://www.youtube.com/watch?v={video_id}" for video_id in urls]
+
+        print(f"Found {len(full_urls)} YouTube URLs.")
+
+        ydl_opts = self.get_yt_dlp_opts(audio_only=self.config["audio_only"])
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            for url in full_urls:
+                try:
+                    print(f"Downloading: {url}")
+                    ydl.download([url])
+                except Exception as e:
+                    print(f"Error downloading {url}: {e}")
+
+    def download_single_video(self, url: str, custom_options: Dict = None) -> None:
+        """Download a single video with custom options"""
+        if not url:
+            print("No URL provided.")
+            return
+
+        # Validate YouTube URL
+        if not re.match(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)', url):
+            print("Invalid YouTube URL.")
+            return
+
+        audio_only = False
+        custom_quality = None
+
+        if custom_options:
+            audio_only = custom_options.get('audio_only', False)
+            custom_quality = custom_options.get('quality')
+
+        ydl_opts = self.get_yt_dlp_opts(audio_only=audio_only, custom_quality=custom_quality)
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                print(f"Downloading: {url}")
+                ydl.download([url])
+                print("Download completed successfully!")
+            except Exception as e:
+                print(f"Error downloading video: {e}")
+
+    def _parse_selection(self, selection: str, items: List) -> List:
+        """Parse user selection string and return selected items"""
+        selected = []
+        parts = selection.split(',')
+
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                try:
+                    start, end = map(int, part.split('-'))
+                    for i in range(start - 1, min(end, len(items))):
+                        if i >= 0:
+                            selected.append(items[i])
+                except ValueError:
+                    continue
+            else:
+                try:
+                    idx = int(part) - 1
+                    if 0 <= idx < len(items):
+                        selected.append(items[idx])
+                except ValueError:
+                    continue
+
+        return selected
+
+    def configure_settings(self) -> None:
+        """Interactive configuration menu"""
+        while True:
+            print("\n" + "=" * 50)
+            print("CONFIGURATION MENU")
+            print("=" * 50)
+            print(f"1. API Key: {'*' * len(self.config['api_key']) if self.config['api_key'] else 'NOT SET'}")
+            print(
+                f"2. Channels: {', '.join(self.config['channels'][:3])}{'...' if len(self.config['channels']) > 3 else ''}")
+            print(f"3. Download path: {self.config['download_path']}")
+            print(f"4. Default days: {self.config['default_days']}")
+            print(f"5. Video quality: {self.config['video_quality']}")
+            print(f"6. Audio quality: {self.config['audio_quality']}")
+            print(f"7. Format: {self.config['format']}")
+            print(f"8. Audio only: {self.config['audio_only']}")
+            print(f"9. Download subtitles: {self.config['download_subtitles']}")
+            print(f"10. Subtitle languages: {', '.join(self.config['subtitle_languages'])}")
+            print(f"11. Max results per channel: {self.config['max_results']}")
+            print("0. Back to main menu")
+
+            choice = input("\nSelect option to modify: ").strip()
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                api_key = input("Enter YouTube Data API key: ").strip()
+                if api_key:
+                    self.config['api_key'] = api_key
+                    print("API key saved!")
+            elif choice == '2':
+                self._configure_channels()
+            elif choice == '3':
+                new_path = input(f"Enter new download path (current: {self.config['download_path']}): ").strip()
+                if new_path:
+                    self.config['download_path'] = new_path
+            elif choice == '4':
+                try:
+                    days = int(input(f"Enter default days (current: {self.config['default_days']}): ").strip())
+                    self.config['default_days'] = days
+                except ValueError:
+                    print("Invalid number.")
+            elif choice == '5':
+                print("Video quality options: best, worst, best[height<=720], etc.")
+                quality = input(f"Enter video quality (current: {self.config['video_quality']}): ").strip()
+                if quality:
+                    self.config['video_quality'] = quality
+            elif choice == '6':
+                quality = input(f"Enter audio quality (current: {self.config['audio_quality']}): ").strip()
+                if quality:
+                    self.config['audio_quality'] = quality
+            elif choice == '7':
+                format_ext = input(f"Enter format (current: {self.config['format']}): ").strip()
+                if format_ext:
+                    self.config['format'] = format_ext
+            elif choice == '8':
+                audio_only = input(
+                    f"Audio only? (y/n, current: {'y' if self.config['audio_only'] else 'n'}): ").strip().lower()
+                if audio_only in ['y', 'n']:
+                    self.config['audio_only'] = audio_only == 'y'
+            elif choice == '9':
+                subtitles = input(
+                    f"Download subtitles? (y/n, current: {'y' if self.config['download_subtitles'] else 'n'}): ").strip().lower()
+                if subtitles in ['y', 'n']:
+                    self.config['download_subtitles'] = subtitles == 'y'
+            elif choice == '10':
+                langs = input(
+                    f"Enter subtitle languages (comma-separated, current: {', '.join(self.config['subtitle_languages'])}): ").strip()
+                if langs:
+                    self.config['subtitle_languages'] = [lang.strip() for lang in langs.split(',')]
+            elif choice == '11':
+                try:
+                    max_results = int(
+                        input(f"Enter max results per channel (current: {self.config['max_results']}): ").strip())
+                    self.config['max_results'] = max_results
+                except ValueError:
+                    print("Invalid number.")
+
+            # Save configuration after any change
+            self.save_config()
+            print("Configuration saved!")
+
+    def _configure_channels(self) -> None:
+        """Configure YouTube channels"""
+        while True:
+            print(f"\nCurrent channels:")
+            for i, channel in enumerate(self.config['channels'], 1):
+                print(f"{i}. {channel}")
+
+            print("\n1. Add channel")
+            print("2. Remove channel")
+            print("3. Back")
+            print("\nNote: You can use channel IDs (24 characters) or handles (@username)")
+
+            choice = input("Select option: ").strip()
+
+            if choice == '1':
+                channel = input("Enter channel ID or handle (e.g., @mkbhd or UCBJycsmduvYEL83R_U4JriQ): ").strip()
+                if channel and channel not in self.config['channels']:
+                    self.config['channels'].append(channel)
+                    print(f"Added {channel}")
+            elif choice == '2':
+                try:
+                    idx = int(input("Enter channel number to remove: ").strip()) - 1
+                    if 0 <= idx < len(self.config['channels']):
+                        removed = self.config['channels'].pop(idx)
+                        print(f"Removed {removed}")
+                except (ValueError, IndexError):
+                    print("Invalid selection.")
+            elif choice == '3':
+                break
+
+    def run(self) -> None:
+        """Main menu loop"""
+        while True:
+            print("\n" + "=" * 50)
+            print("YOUTUBE DOWNLOADER (API Version)")
+            print("=" * 50)
+            api_status = "✓ Configured" if self.config.get('api_key') else "✗ NOT CONFIGURED"
+            print(f"API Status: {api_status}")
+            print("=" * 50)
+            print("1. Fetch latest videos from channels")
+            print("2. Download videos from fetched JSON")
+            print("3. Download videos from file with links")
+            print("4. Download single video")
+            print("5. Configure settings")
+            print("6. Exit")
+
+            choice = input("\nSelect an option: ").strip()
+
+            if choice == '1':
+                if not self.check_api_key():
+                    continue
+                days_input = input(f"Enter number of days (default: {self.config['default_days']}): ").strip()
+                days = int(days_input) if days_input.isdigit() else self.config['default_days']
+                self.fetch_channel_videos(days)
+
+            elif choice == '2':
+                self.download_from_json()
+
+            elif choice == '3':
+                file_path = input("Enter path to file with links: ").strip()
+                self.download_from_file(file_path)
+
+            elif choice == '4':
+                url = input("Enter YouTube URL: ").strip()
+
+                # Ask for custom options
+                print("\nCustom download options:")
+                audio_only = input("Download audio only? (y/n): ").strip().lower() == 'y'
+
+                custom_quality = None
+                if not audio_only:
+                    quality = input("Enter video quality (press Enter for default): ").strip()
+                    if quality:
+                        custom_quality = quality
+
+                custom_options = {
+                    'audio_only': audio_only,
+                    'quality': custom_quality
+                }
+
+                self.download_single_video(url, custom_options)
+
+            elif choice == '5':
+                self.configure_settings()
+
+            elif choice == '6':
+                print("Goodbye!")
+                break
+
+            else:
+                print("Invalid option. Please try again.")
+
+
+if __name__ == "__main__":
+    try:
+        downloader = YouTubeDownloaderAPI()
+        downloader.run()
+    except KeyboardInterrupt:
+        print("\n\nProgram interrupted by user.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
